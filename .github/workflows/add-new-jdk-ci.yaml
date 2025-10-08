@@ -80,6 +80,9 @@ jobs:
             };
       - name: Create Pull Request
         run: |
+          set -x
+          branch_name="update-ci-version-${{ github.event.inputs.java_version }}"
+          git checkout -b "${branch_name}"
           message='build: add testing for JDK ${{ steps.update_file.outputs.new_version }}'
           git config --global user.email "diegomarquezp@google.com"
           git config --global user.name "Diego Marquez"
@@ -88,7 +91,7 @@ jobs:
 
           gh pr create \
             --base main \
-            --head update-ci-version-${{ github.event.inputs.java_version }} \
+            --head "${branch_name}" \
             --title "${message}" \
             --body 'generated with Update Java Version in CI GitHub action'
         env:
