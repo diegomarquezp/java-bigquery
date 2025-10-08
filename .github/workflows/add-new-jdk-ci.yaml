@@ -83,6 +83,8 @@ jobs:
           message='build: add testing for JDK ${{ steps.update_file.outputs.new_version }}'
           git add .
           git commit -m "${message}"
+          git config --global user.email "diegomarquezp@google.com"
+          git config --global user.name "Diego Marquez"
           gh pr create \
             --base main \
             --head update-ci-version-${{ github.event.inputs.java_version }} \
