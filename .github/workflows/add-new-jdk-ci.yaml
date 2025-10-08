@@ -80,10 +80,13 @@ jobs:
             };
       - name: Create Pull Request
         run: |
+          message = 'build: add testing for JDK ${{ steps.update_file.outputs.new_version }}'
+          git add .
+          git commit -m "${message}"
           gh pr create \
             --base main \
             --head update-ci-version-${{ github.event.inputs.java_version }} \
-            --title 'build: add testing for JDK ${{ steps.update_file.outputs.new_version }}' \
+            --title "${message}" \
             --body 'generated with Update Java Version in CI GitHub action'
         env:
           GITHUB_TOKEN: ${{ secrets.MY_GH_TOKEN }}
