@@ -1,0 +1,90 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Update Java Version in CI
+on:
+  workflow_dispatch:
+    inputs:
+      java_version:
+        description: 'Java version to add or replace (e.g. "25")'
+        required: true
+      action:
+        description: 'Append or replace the version'
+        required: true
+        type: choice
+        options:
+        - append
+        - replace
+        default: 'append'
+
+jobs:
+  update_ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Update Java version in ci.yaml
+        id: update_file
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const yaml = require('js-yaml');
+            const filePath = '.github/workflows/ci.yaml';
+            const fileContents = fs.readFileSync(filePath, 'utf8');
+            const doc = yaml.load(fileContents);
+
+            const javaVersions = doc.jobs.units.strategy.matrix.java;
+            const newVersion = ${{ github.event.inputs.java_version }};
+            const action = '${{ github.event.inputs.action }}';
+
+            if (action === 'append') {
+              if (!javaVersions.includes(newVersion)) {
+                javaVersions.push(newVersion);
+              }
+            } else if (action === 'replace') {
+              if (javaVersions.length > 0) {
+                javaVersions[javaVersions.length - 1] = newVersion;
+              }
+            }
+
+            doc.jobs.units.strategy.matrix.java = javaVersions;
+
+            const newFileContents = yaml.dump(doc, {
+              lineWidth: -1, // prevent line wrapping
+              noArrayIndent: true
+            });
+
+            // The js-yaml library adds quotes to numbers, so we remove them.
+            // This is a bit of a workaround to keep the formatting clean.
+            const cleanedNewFileContents = newFileContents.replace(/'(\d+)'/g, '$1');
+
+            fs.writeFileSync(filePath, cleanedNewFileContents, 'utf8');
+
+            return {
+              new_version: newVersion,
+              branch_name: `update-jdk-${newVersion}`
+            };
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "build: add testing for JDK ${{ steps.update_file.outputs.new_version }}"
+          branch: ${{ steps.update_file.outputs.branch_name }}
+          delete-branch: true
+          title: "build: add testing for JDK ${{ steps.update_file.outputs.new_version }}"
+          body: "generated with Update Java Version in CI GitHub action"
+          labels: "automerge"
