@@ -41,11 +41,15 @@ import com.google.cloud.Role;
 import com.google.cloud.ServiceOptions;
 import com.google.cloud.bigquery.Acl;
 import com.google.cloud.bigquery.Acl.DatasetAclEntity;
+import com.google.cloud.bigquery.Acl.Expr;
+import com.google.cloud.bigquery.Acl.User;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQuery.DatasetDeleteOption;
 import com.google.cloud.bigquery.BigQuery.DatasetField;
 import com.google.cloud.bigquery.BigQuery.DatasetListOption;
 import com.google.cloud.bigquery.BigQuery.DatasetOption;
+import com.google.cloud.bigquery.BigQuery.DatasetUpdateMode;
+import com.google.cloud.bigquery.BigQuery.DatasetView;
 import com.google.cloud.bigquery.BigQuery.JobField;
 import com.google.cloud.bigquery.BigQuery.JobListOption;
 import com.google.cloud.bigquery.BigQuery.JobOption;
@@ -57,6 +61,7 @@ import com.google.cloud.bigquery.BigQueryError;
 import com.google.cloud.bigquery.BigQueryException;
 import com.google.cloud.bigquery.BigQueryOptions;
 import com.google.cloud.bigquery.BigQueryResult;
+import com.google.cloud.bigquery.BigQueryRetryConfig;
 import com.google.cloud.bigquery.BigQuerySQLException;
 import com.google.cloud.bigquery.CloneDefinition;
 import com.google.cloud.bigquery.Clustering;
@@ -108,6 +113,8 @@ import com.google.cloud.bigquery.ParquetOptions;
 import com.google.cloud.bigquery.PolicyTags;
 import com.google.cloud.bigquery.PrimaryKey;
 import com.google.cloud.bigquery.QueryJobConfiguration;
+import com.google.cloud.bigquery.QueryJobConfiguration.JobCreationMode;
+import com.google.cloud.bigquery.QueryJobConfiguration.Priority;
 import com.google.cloud.bigquery.QueryParameterValue;
 import com.google.cloud.bigquery.Range;
 import com.google.cloud.bigquery.RangePartitioning;
@@ -154,6 +161,17 @@ import com.google.common.collect.Sets;
 import com.google.common.io.BaseEncoding;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.gson.JsonObject;
+import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.Tracer;
+import io.opentelemetry.context.Scope;
+import io.opentelemetry.sdk.OpenTelemetrySdk;
+import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.trace.SdkTracerProvider;
+import io.opentelemetry.sdk.trace.data.SpanData;
+import io.opentelemetry.sdk.trace.export.SimpleSpanProcessor;
+import io.opentelemetry.sdk.trace.samplers.Sampler;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -167,6 +185,7 @@ import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Time;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalTime;
 import java.time.Period;
@@ -193,7 +212,6 @@ import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
-import org.threeten.bp.Duration;
 import org.threeten.extra.PeriodDuration;
 
 public class ITBigQueryTest {
@@ -211,6 +229,13 @@ public class ITBigQueryTest {
   private static final String PROJECT_ID = ServiceOptions.getDefaultProjectId();
   private static final String RANDOM_ID = UUID.randomUUID().toString().substring(0, 8);
   private static final String STORAGE_BILLING_MODEL = "LOGICAL";
+  private static final Long MAX_TIME_TRAVEL_HOURS = 120L;
+  private static final Long MAX_TIME_TRAVEL_HOURS_DEFAULT = 168L;
+  private static final Map<String, Map<AttributeKey<?>, Object>> OTEL_ATTRIBUTES =
+      new HashMap<String, Map<AttributeKey<?>, Object>>();
+  private static final Map<String, String> OTEL_PARENT_SPAN_IDS = new HashMap<>();
+  private static final Map<String, String> OTEL_SPAN_IDS_TO_NAMES = new HashMap<>();
+  private static final String OTEL_PARENT_SPAN_ID = "0000000000000000";
   private static final String CLOUD_SAMPLES_DATA =
       Optional.fromNullable(System.getenv("CLOUD_SAMPLES_DATA_BUCKET")).or("cloud-samples-data");
   private static final Map<String, String> LABELS =
@@ -588,6 +613,7 @@ public class ITBigQueryTest {
   private static final String LOAD_FILE_LARGE = "load_large.csv";
 
   private static final String LOAD_FILE_FLEXIBLE_COLUMN_NAME = "load_flexible_column_name.csv";
+  private static final String LOAD_FILE_NULL = "load_null.csv";
   private static final String JSON_LOAD_FILE = "load.json";
   private static final String JSON_LOAD_FILE_BQ_RESULTSET = "load_bq_resultset.json";
   private static final String JSON_LOAD_FILE_SIMPLE = "load_simple.json";
@@ -603,6 +629,7 @@ public class ITBigQueryTest {
   private static final TableId TABLE_ID_FASTQUERY_BQ_RESULTSET =
       TableId.of(DATASET, "fastquery_testing_bq_resultset");
   private static final String CSV_CONTENT = "StringValue1\nStringValue2\n";
+  private static final String CSV_CONTENT_NULL = "String\0Value1\n";
   private static final String CSV_CONTENT_FLEXIBLE_COLUMN = "name,&ampersand\nrow_name,1";
 
   private static final String JSON_CONTENT =
@@ -1008,6 +1035,32 @@ public class ITBigQueryTest {
 
   private static BigQuery bigquery;
   private static Storage storage;
+  private static OpenTelemetry otel;
+
+  private static class TestSpanExporter implements io.opentelemetry.sdk.trace.export.SpanExporter {
+    @Override
+    public CompletableResultCode export(Collection<SpanData> collection) {
+      if (collection.isEmpty()) {
+        return CompletableResultCode.ofFailure();
+      }
+      for (SpanData data : collection) {
+        OTEL_ATTRIBUTES.put(data.getName(), data.getAttributes().asMap());
+        OTEL_PARENT_SPAN_IDS.put(data.getName(), data.getParentSpanId());
+        OTEL_SPAN_IDS_TO_NAMES.put(data.getSpanId(), data.getName());
+      }
+      return CompletableResultCode.ofSuccess();
+    }
+
+    @Override
+    public CompletableResultCode flush() {
+      return CompletableResultCode.ofSuccess();
+    }
+
+    @Override
+    public CompletableResultCode shutdown() {
+      return CompletableResultCode.ofSuccess();
+    }
+  }
 
   @Rule public Timeout globalTimeout = Timeout.seconds(300);
 
@@ -1016,12 +1069,22 @@ public class ITBigQueryTest {
     RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
     RemoteStorageHelper storageHelper = RemoteStorageHelper.create();
     Map<String, String> labels = ImmutableMap.of("test-job-name", "test-load-job");
+    SdkTracerProvider tracerProvider =
+        SdkTracerProvider.builder()
+            .addSpanProcessor(SimpleSpanProcessor.create(new TestSpanExporter()))
+            .setSampler(Sampler.alwaysOn())
+            .build();
+    otel = OpenTelemetrySdk.builder().setTracerProvider(tracerProvider).buildAndRegisterGlobal();
+
     bigquery = bigqueryHelper.getOptions().getService();
     storage = storageHelper.getOptions().getService();
     storage.create(BucketInfo.of(BUCKET));
     storage.create(
         BlobInfo.newBuilder(BUCKET, LOAD_FILE).setContentType("text/plain").build(),
         CSV_CONTENT.getBytes(StandardCharsets.UTF_8));
+    storage.create(
+        BlobInfo.newBuilder(BUCKET, LOAD_FILE_NULL).setContentType("text/plain").build(),
+        CSV_CONTENT_NULL.getBytes(StandardCharsets.UTF_8));
     storage.create(
         BlobInfo.newBuilder(BUCKET, LOAD_FILE_FLEXIBLE_COLUMN_NAME)
             .setContentType("text/plain")
@@ -1212,6 +1275,51 @@ public class ITBigQueryTest {
     assertNull(dataset.getLocation());
     assertNull(dataset.getSelfLink());
     assertNull(dataset.getStorageBillingModel());
+    assertNull(dataset.getMaxTimeTravelHours());
+  }
+
+  @Test
+  public void testGetDatasetWithAccessPolicyVersion() throws IOException {
+    String accessPolicyDataset = RemoteBigQueryHelper.generateDatasetName();
+    ServiceAccountCredentials credentials =
+        (ServiceAccountCredentials) GoogleCredentials.getApplicationDefault();
+    User user = new User(credentials.getClientEmail());
+    Acl.Role role = Acl.Role.WRITER;
+    Acl.Expr condition =
+        new Expr(
+            "request.time > timestamp('2024-01-01T00:00:00Z')",
+            "test condition",
+            "requests after the year 2024",
+            "location");
+    Acl acl = Acl.of(user, role, condition);
+    DatasetOption accessPolicyOption = DatasetOption.accessPolicyVersion(3);
+    DatasetOption viewOption = DatasetOption.datasetView(DatasetView.FULL);
+
+    Dataset dataset =
+        bigquery.create(
+            DatasetInfo.newBuilder(accessPolicyDataset)
+                .setDescription("Some Description")
+                .setAcl(ImmutableList.of(acl))
+                .build(),
+            accessPolicyOption);
+    assertThat(dataset).isNotNull();
+
+    Dataset remoteDataset =
+        bigquery.getDataset(accessPolicyDataset, accessPolicyOption, viewOption);
+    assertNotNull(remoteDataset);
+    assertEquals(dataset.getDescription(), remoteDataset.getDescription());
+    assertNotNull(remoteDataset.getCreationTime());
+
+    Acl remoteAclWithCond = null;
+    for (Acl remoteAcl : remoteDataset.getAcl()) {
+      if (remoteAcl.getCondition() != null) {
+        remoteAclWithCond = remoteAcl;
+      }
+    }
+    assertNotNull(remoteAclWithCond);
+    assertEquals(remoteAclWithCond.getCondition(), condition);
+
+    RemoteBigQueryHelper.forceDelete(bigquery, accessPolicyDataset);
   }
 
   @Test
@@ -1228,21 +1336,23 @@ public class ITBigQueryTest {
     assertThat(dataset.getDescription()).isEqualTo("Some Description");
     assertThat(dataset.getLabels()).containsExactly("a", "b");
     assertThat(dataset.getStorageBillingModel()).isNull();
+    assertThat(dataset.getMaxTimeTravelHours()).isNull();
 
     Map<String, String> updateLabels = new HashMap<>();
     updateLabels.put("x", "y");
     updateLabels.put("a", null);
     Dataset updatedDataset =
         bigquery.update(
-            dataset
-                .toBuilder()
+            dataset.toBuilder()
                 .setDescription("Updated Description")
                 .setLabels(updateLabels)
                 .setStorageBillingModel("LOGICAL")
+                .setMaxTimeTravelHours(MAX_TIME_TRAVEL_HOURS)
                 .build());
     assertThat(updatedDataset.getDescription()).isEqualTo("Updated Description");
     assertThat(updatedDataset.getLabels()).containsExactly("x", "y");
     assertThat(updatedDataset.getStorageBillingModel()).isEqualTo("LOGICAL");
+    assertThat(updatedDataset.getMaxTimeTravelHours()).isEqualTo(MAX_TIME_TRAVEL_HOURS);
 
     updatedDataset = bigquery.update(updatedDataset.toBuilder().setLabels(null).build());
     assertThat(updatedDataset.getLabels()).isEmpty();
@@ -1273,7 +1383,61 @@ public class ITBigQueryTest {
     assertNull(updatedDataset.getLocation());
     assertNull(updatedDataset.getSelfLink());
     assertNull(updatedDataset.getStorageBillingModel());
+    assertNull(updatedDataset.getMaxTimeTravelHours());
     assertTrue(dataset.delete());
+  }
+
+  @Test
+  public void testUpdateDatasetWithAccessPolicyVersion() throws IOException {
+    String accessPolicyDataset = RemoteBigQueryHelper.generateDatasetName();
+    ServiceAccountCredentials credentials =
+        (ServiceAccountCredentials) GoogleCredentials.getApplicationDefault();
+    Dataset dataset =
+        bigquery.create(
+            DatasetInfo.newBuilder(accessPolicyDataset)
+                .setDescription("Some Description")
+                .setLabels(Collections.singletonMap("a", "b"))
+                .build());
+    assertThat(dataset).isNotNull();
+
+    User user = new User(credentials.getClientEmail());
+    Acl.Role role = Acl.Role.WRITER;
+    Acl.Expr condition =
+        new Expr(
+            "request.time > timestamp('2024-01-01T00:00:00Z')",
+            "test condition",
+            "requests after the year 2024",
+            "location");
+    Acl acl = Acl.of(user, role, condition);
+    List<Acl> acls = new ArrayList<>();
+    acls.addAll(dataset.getAcl());
+    acls.add(acl);
+
+    DatasetOption datasetOption = DatasetOption.accessPolicyVersion(3);
+    DatasetOption updateModeOption = DatasetOption.updateMode(DatasetUpdateMode.UPDATE_FULL);
+    Dataset updatedDataset =
+        bigquery.update(
+            dataset.toBuilder()
+                .setDescription("Updated Description")
+                .setLabels(null)
+                .setAcl(acls)
+                .build(),
+            datasetOption,
+            updateModeOption);
+    assertNotNull(updatedDataset);
+    assertEquals(updatedDataset.getDescription(), "Updated Description");
+    assertThat(updatedDataset.getLabels().isEmpty());
+
+    Acl updatedAclWithCond = null;
+    for (Acl updatedAcl : updatedDataset.getAcl()) {
+      if (updatedAcl.getCondition() != null) {
+        updatedAclWithCond = updatedAcl;
+      }
+    }
+    assertNotNull(updatedAclWithCond);
+    assertEquals(updatedAclWithCond.getCondition(), condition);
+
+    RemoteBigQueryHelper.forceDelete(bigquery, accessPolicyDataset);
   }
 
   @Test
@@ -1629,6 +1793,40 @@ public class ITBigQueryTest {
   }
 
   @Test
+  public void testCreateDatasetWithSpecificMaxTimeTravelHours() {
+    String timeTravelDataset = RemoteBigQueryHelper.generateDatasetName();
+    DatasetInfo info =
+        DatasetInfo.newBuilder(timeTravelDataset)
+            .setDescription(DESCRIPTION)
+            .setMaxTimeTravelHours(MAX_TIME_TRAVEL_HOURS)
+            .setLabels(LABELS)
+            .build();
+    bigquery.create(info);
+
+    Dataset dataset = bigquery.getDataset(DatasetId.of(timeTravelDataset));
+    assertEquals(MAX_TIME_TRAVEL_HOURS, dataset.getMaxTimeTravelHours());
+
+    RemoteBigQueryHelper.forceDelete(bigquery, timeTravelDataset);
+  }
+
+  @Test
+  public void testCreateDatasetWithDefaultMaxTimeTravelHours() {
+    String timeTravelDataset = RemoteBigQueryHelper.generateDatasetName();
+    DatasetInfo info =
+        DatasetInfo.newBuilder(timeTravelDataset)
+            .setDescription(DESCRIPTION)
+            .setLabels(LABELS)
+            .build();
+    bigquery.create(info);
+
+    Dataset dataset = bigquery.getDataset(DatasetId.of(timeTravelDataset));
+    // In the backend, BigQuery sets the default Time Travel Window to be 168 hours (7 days).
+    assertEquals(MAX_TIME_TRAVEL_HOURS_DEFAULT, dataset.getMaxTimeTravelHours());
+
+    RemoteBigQueryHelper.forceDelete(bigquery, timeTravelDataset);
+  }
+
+  @Test
   public void testCreateDatasetWithDefaultCollation() {
     String collationDataset = RemoteBigQueryHelper.generateDatasetName();
     DatasetInfo info =
@@ -1643,6 +1841,70 @@ public class ITBigQueryTest {
     assertEquals("und:ci", dataset.getDefaultCollation());
 
     RemoteBigQueryHelper.forceDelete(bigquery, collationDataset);
+  }
+
+  @Test
+  public void testCreateDatasetWithAccessPolicyVersion() throws IOException {
+    String accessPolicyDataset = RemoteBigQueryHelper.generateDatasetName();
+    ServiceAccountCredentials credentials =
+        (ServiceAccountCredentials) GoogleCredentials.getApplicationDefault();
+    User user = new User(credentials.getClientEmail());
+    Acl.Role role = Acl.Role.OWNER;
+    Acl.Expr condition =
+        new Expr(
+            "request.time > timestamp('2024-01-01T00:00:00Z')",
+            "test condition",
+            "requests after the year 2024",
+            "location");
+    Acl acl = Acl.of(user, role, condition);
+    DatasetInfo info =
+        DatasetInfo.newBuilder(accessPolicyDataset)
+            .setDescription(DESCRIPTION)
+            .setLabels(LABELS)
+            .setAcl(ImmutableList.of(acl))
+            .build();
+    DatasetOption datasetOption = DatasetOption.accessPolicyVersion(3);
+    Dataset dataset = bigquery.create(info, datasetOption);
+    assertNotNull(dataset);
+    assertEquals(dataset.getDescription(), DESCRIPTION);
+
+    Acl remoteAclWithCond = null;
+    for (Acl remoteAcl : dataset.getAcl()) {
+      if (remoteAcl.getCondition() != null) {
+        remoteAclWithCond = remoteAcl;
+      }
+    }
+    assertNotNull(remoteAclWithCond);
+    assertEquals(remoteAclWithCond.getCondition(), condition);
+
+    RemoteBigQueryHelper.forceDelete(bigquery, accessPolicyDataset);
+  }
+
+  @Test(expected = BigQueryException.class)
+  public void testCreateDatasetWithInvalidAccessPolicyVersion() throws IOException {
+    String accessPolicyDataset = RemoteBigQueryHelper.generateDatasetName();
+    ServiceAccountCredentials credentials =
+        (ServiceAccountCredentials) GoogleCredentials.getApplicationDefault();
+    User user = new User(credentials.getClientEmail());
+    Acl.Role role = Acl.Role.READER;
+    Acl.Expr condition =
+        new Expr(
+            "request.time > timestamp('2024-01-01T00:00:00Z')",
+            "test condition",
+            "requests after the year 2024",
+            "location");
+    Acl acl = Acl.of(user, role, condition);
+    DatasetInfo info =
+        DatasetInfo.newBuilder(accessPolicyDataset)
+            .setDescription(DESCRIPTION)
+            .setLabels(LABELS)
+            .setAcl(ImmutableList.of(acl))
+            .build();
+    DatasetOption datasetOption = DatasetOption.accessPolicyVersion(4);
+    Dataset dataset = bigquery.create(info, datasetOption);
+    assertNotNull(dataset);
+
+    RemoteBigQueryHelper.forceDelete(bigquery, accessPolicyDataset);
   }
 
   @Test
@@ -1837,8 +2099,7 @@ public class ITBigQueryTest {
       fieldList.add(stringFieldWithPolicy);
       Schema updatedSchemaWithPolicyTag = Schema.of(fieldList);
       Table updatedTable =
-          createdTableForUpdate
-              .toBuilder()
+          createdTableForUpdate.toBuilder()
               .setDefinition(StandardTableDefinition.of(updatedSchemaWithPolicyTag))
               .build();
       updatedTable.update();
@@ -2109,9 +2370,13 @@ public class ITBigQueryTest {
   public void testCreateExternalTable() throws InterruptedException {
     String tableName = "test_create_external_table";
     TableId tableId = TableId.of(DATASET, tableName);
+
     ExternalTableDefinition externalTableDefinition =
         ExternalTableDefinition.of(
-            "gs://" + BUCKET + "/" + JSON_LOAD_FILE, TABLE_SCHEMA, FormatOptions.json());
+                "gs://" + BUCKET + "/" + JSON_LOAD_FILE, TABLE_SCHEMA, FormatOptions.json())
+            .toBuilder()
+            .setMaxStaleness("INTERVAL 15 MINUTE")
+            .build();
     TableInfo tableInfo = TableInfo.of(tableId, externalTableDefinition);
     Table createdTable = bigquery.create(tableInfo);
     assertNotNull(createdTable);
@@ -2204,14 +2469,10 @@ public class ITBigQueryTest {
 
     Table updatedTable =
         bigquery.update(
-            createdTable
-                .toBuilder()
+            createdTable.toBuilder()
                 .setDefinition(
                     ((ExternalTableDefinition) createdTable.getDefinition())
-                        .toBuilder()
-                        .setSchema(null)
-                        .setAutodetect(true)
-                        .build())
+                        .toBuilder().setSchema(null).setAutodetect(true).build())
                 .build(),
             BigQuery.TableOption.autodetectSchema(true));
     // Schema should change.
@@ -2311,8 +2572,7 @@ public class ITBigQueryTest {
     // get and modify policy
     Policy policy = bigquery.getIamPolicy(tableId);
     Policy editedPolicy =
-        policy
-            .toBuilder()
+        policy.toBuilder()
             .addIdentity(Role.of("roles/bigquery.dataViewer"), Identity.allUsers())
             .build();
     Policy updatedPolicy = bigquery.setIamPolicy(tableId, editedPolicy);
@@ -2448,8 +2708,7 @@ public class ITBigQueryTest {
     updateLabels.put("a", null);
     Table updatedTable =
         bigquery.update(
-            createdTable
-                .toBuilder()
+            createdTable.toBuilder()
                 .setDescription("Updated Description")
                 .setLabels(updateLabels)
                 .build());
@@ -2478,11 +2737,9 @@ public class ITBigQueryTest {
         .isNull();
 
     table =
-        table
-            .toBuilder()
+        table.toBuilder()
             .setDefinition(
-                tableDefinition
-                    .toBuilder()
+                tableDefinition.toBuilder()
                     .setTimePartitioning(TimePartitioning.of(Type.DAY, 42L))
                     .build())
             .build()
@@ -2493,11 +2750,9 @@ public class ITBigQueryTest {
         .isEqualTo(42L);
 
     table =
-        table
-            .toBuilder()
+        table.toBuilder()
             .setDefinition(
-                tableDefinition
-                    .toBuilder()
+                tableDefinition.toBuilder()
                     .setTimePartitioning(TimePartitioning.of(Type.DAY))
                     .build())
             .build()
@@ -2937,8 +3192,7 @@ public class ITBigQueryTest {
 
     // Mutate metadata.
     RoutineInfo newInfo =
-        routine
-            .toBuilder()
+        routine.toBuilder()
             .setBody("x * 4")
             .setReturnType(routine.getReturnType())
             .setArguments(routine.getArguments())
@@ -3188,6 +3442,42 @@ public class ITBigQueryTest {
     }
   }
 
+  @Test
+  public void testLosslessTimestamp() throws InterruptedException {
+    String query = "SELECT TIMESTAMP '2022-01-24T23:54:25.095574Z'";
+    long expectedTimestamp = 1643068465095574L;
+
+    TableResult result =
+        bigquery.query(
+            QueryJobConfiguration.newBuilder(query)
+                .setDefaultDataset(DatasetId.of(DATASET))
+                .build());
+    assertNotNull(result.getJobId());
+    for (FieldValueList row : result.getValues()) {
+      FieldValue timeStampCell = row.get(0);
+      assertFalse(timeStampCell.getUseInt64Timestamps());
+      assertEquals(expectedTimestamp, timeStampCell.getTimestampValue());
+    }
+
+    // Create new BQ object to toggle lossless timestamps without affecting
+    // other tests.
+    RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
+    BigQuery bigqueryLossless = bigqueryHelper.getOptions().getService();
+    bigqueryLossless.getOptions().setUseInt64Timestamps(true);
+
+    TableResult resultLossless =
+        bigqueryLossless.query(
+            QueryJobConfiguration.newBuilder(query)
+                .setDefaultDataset(DatasetId.of(DATASET))
+                .build());
+    assertNotNull(resultLossless.getJobId());
+    for (FieldValueList row : resultLossless.getValues()) {
+      FieldValue timeStampCellLossless = row.get(0);
+      assertTrue(timeStampCellLossless.getUseInt64Timestamps());
+      assertEquals(expectedTimestamp, timeStampCellLossless.getTimestampValue());
+    }
+  }
+
   /* TODO(prasmish): replicate the entire test case for executeSelect */
   @Test
   public void testQuery() throws InterruptedException {
@@ -3246,6 +3536,130 @@ public class ITBigQueryTest {
     String query = "SELECT corpus FROM `bigquery-public-data.samples.shakespeare` GROUP BY corpus;";
     BigQueryResult bigQueryResult = connection.executeSelect(query);
     assertEquals(42, bigQueryResult.getTotalRows());
+    assertFalse(bigQueryResult.getBigQueryResultStats().getQueryStatistics().getUseReadApi());
+  }
+
+  @Test
+  public void testExecuteSelectWithReadApi() throws SQLException {
+    final int rowLimit = 5000;
+    final String QUERY =
+        "SELECT * FROM bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2017 LIMIT %s";
+    bigquery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_REQUIRED);
+    // Job timeout is somewhat arbitrary - just ensures that fast query is not used.
+    // min result size and page row count ratio ensure that the ReadAPI is used.
+    ConnectionSettings connectionSettingsReadAPIEnabledFastQueryDisabled =
+        ConnectionSettings.newBuilder()
+            .setUseReadAPI(true)
+            .setJobTimeoutMs(Long.MAX_VALUE)
+            .setMinResultSize(500)
+            .setTotalToPageRowCountRatio(1)
+            .build();
+
+    Connection connectionReadAPIEnabled =
+        bigquery.createConnection(connectionSettingsReadAPIEnabledFastQueryDisabled);
+
+    String selectQuery = String.format(QUERY, rowLimit);
+
+    BigQueryResult bigQueryResultSet = connectionReadAPIEnabled.executeSelect(selectQuery);
+    ResultSet rs = bigQueryResultSet.getResultSet();
+    // Paginate results to avoid an InterruptedException
+    while (rs.next()) {}
+
+    assertTrue(bigQueryResultSet.getBigQueryResultStats().getQueryStatistics().getUseReadApi());
+    connectionReadAPIEnabled.close();
+  }
+
+  @Test
+  public void testExecuteSelectWithFastQueryReadApi() throws SQLException {
+    final int rowLimit = 5000;
+    final String QUERY =
+        "SELECT * FROM bigquery-public-data.new_york_taxi_trips.tlc_yellow_trips_2017 LIMIT %s";
+    // min result size and page row count ratio ensure that the ReadAPI is used.
+    ConnectionSettings connectionSettingsReadAPIEnabledFastQueryDisabled =
+        ConnectionSettings.newBuilder()
+            .setUseReadAPI(true)
+            .setMinResultSize(500)
+            .setTotalToPageRowCountRatio(1)
+            .build();
+
+    Connection connectionReadAPIEnabled =
+        bigquery.createConnection(connectionSettingsReadAPIEnabledFastQueryDisabled);
+
+    String selectQuery = String.format(QUERY, rowLimit);
+
+    BigQueryResult bigQueryResultSet = connectionReadAPIEnabled.executeSelect(selectQuery);
+    ResultSet rs = bigQueryResultSet.getResultSet();
+    // Paginate results to avoid an InterruptedException
+    while (rs.next()) {}
+
+    assertTrue(bigQueryResultSet.getBigQueryResultStats().getQueryStatistics().getUseReadApi());
+    connectionReadAPIEnabled.close();
+  }
+
+  @Test
+  public void testExecuteSelectReadApiEmptyResultSet() throws SQLException {
+    ConnectionSettings connectionSettings =
+        ConnectionSettings.newBuilder()
+            .setJobTimeoutMs(
+                Long.MAX_VALUE) // Force executeSelect to use ReadAPI instead of fast query.
+            .setUseReadAPI(true)
+            .setUseQueryCache(false)
+            .build();
+    Connection connection = bigquery.createConnection(connectionSettings);
+    String query = "SELECT TIMESTAMP '2022-01-24T23:54:25.095574Z' LIMIT 0";
+    BigQueryResult bigQueryResult = connection.executeSelect(query);
+
+    ResultSet rs = bigQueryResult.getResultSet();
+    assertThat(rs.next()).isFalse();
+    assertThat(bigQueryResult.getTotalRows()).isEqualTo(0);
+  }
+
+  @Test
+  public void testExecuteSelectWithCredentials() throws SQLException {
+    // This test validate that executeSelect uses the same credential provided by the BigQuery
+    // object used to create the Connection client.
+    // This is done the following scenarios:
+    // 1. Validate that setting a valid credential executes the query.
+    // 2. Validate that setting an invalid credential causes failure.
+
+    // Scenario 1.
+    // Create a new bigQuery object but explicitly set the credentials.
+    RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
+    BigQueryOptions bigQueryOptions =
+        bigqueryHelper.getOptions().toBuilder()
+            .setCredentials(bigquery.getOptions().getCredentials())
+            .build();
+    BigQuery bigQueryGoodCredentials = bigQueryOptions.getService();
+
+    ConnectionSettings connectionSettings =
+        ConnectionSettings.newBuilder()
+            .setPriority(Priority.INTERACTIVE) //  Force non-fast query to use BigQueryReadClient.
+            .setDefaultDataset(DatasetId.of(DATASET))
+            .build();
+    Connection connectionGoodCredentials =
+        bigQueryGoodCredentials.createConnection(connectionSettings);
+    String query =
+        "SELECT * FROM "
+            + TABLE_ID_LARGE.getTable(); // Large query result is needed to use BigQueryReadClient.
+    BigQueryResult bigQueryResult = connectionGoodCredentials.executeSelect(query);
+    assertEquals(313348, bigQueryResult.getTotalRows());
+    assertTrue(bigQueryResult.getBigQueryResultStats().getQueryStatistics().getUseReadApi());
+
+    // Scenario 2.
+    // Create a new bigQuery object but explicitly an invalid credential.
+    BigQueryOptions bigQueryOptionsBadCredentials =
+        bigqueryHelper.getOptions().toBuilder()
+            .setCredentials(loadCredentials(FAKE_JSON_CRED_WITH_GOOGLE_DOMAIN))
+            .build();
+    BigQuery bigQueryBadCredentials = bigQueryOptionsBadCredentials.getService();
+    Connection connectionBadCredentials =
+        bigQueryBadCredentials.createConnection(connectionSettings);
+    try {
+      connectionBadCredentials.executeSelect(query);
+      fail(); // this line should not be reached
+    } catch (BigQuerySQLException e) {
+      assertNotNull(e);
+    }
   }
 
   /* TODO(prasmish): replicate the entire test case for executeSelect */
@@ -3555,6 +3969,75 @@ public class ITBigQueryTest {
         (com.google.cloud.bigquery.FieldValueList) rs.getObject("IntegerArrayField");
     assertEquals(4, integerArrayFieldValue.size()); // Array has 4 elements
     assertEquals(3, (integerArrayFieldValue.get(2).getNumericValue()).intValue());
+    List<FieldValue> integerArrayFieldValueList =
+        (List<FieldValue>) rs.getArray("IntegerArrayField").getArray();
+    assertEquals(4, integerArrayFieldValueList.size());
+    assertEquals(3, integerArrayFieldValueList.get(2).getNumericValue().intValue());
+
+    assertFalse(rs.next()); // no 3rd row in the table
+  }
+
+  @Test
+  public void testExecuteSelectSinglePageTableRowWithReadAPI() throws SQLException {
+    String query =
+        "select StringField,  BigNumericField, BooleanField, BytesField, IntegerField, TimestampField, FloatField, "
+            + "NumericField, TimeField, DateField,  DateTimeField , GeographyField, RecordField.BytesField, RecordField.BooleanField, IntegerArrayField from "
+            + TABLE_ID_FASTQUERY_BQ_RESULTSET.getTable()
+            + " order by TimestampField";
+    ConnectionSettings connectionSettings =
+        ConnectionSettings.newBuilder()
+            .setDefaultDataset(DatasetId.of(DATASET))
+            .setUseReadAPI(true)
+            .setMinResultSize(1)
+            .setTotalToPageRowCountRatio(1)
+            .build();
+    Connection connection = bigquery.createConnection(connectionSettings);
+    BigQueryResult bigQueryResult = connection.executeSelect(query);
+    assertTrue(bigQueryResult.getBigQueryResultStats().getQueryStatistics().getUseReadApi());
+    ResultSet rs = bigQueryResult.getResultSet();
+    Schema sc = bigQueryResult.getSchema();
+
+    assertEquals(BQ_RESULTSET_EXPECTED_SCHEMA, sc); // match the schema
+    assertEquals(2, bigQueryResult.getTotalRows()); // Expecting 2 rows
+
+    assertTrue(rs.next()); // first row
+    // checking for the null or 0 column values
+    assertNull(rs.getString("StringField"));
+    assertTrue(rs.getDouble("BigNumericField") == 0.0d);
+    assertFalse(rs.getBoolean("BooleanField"));
+    assertNull(rs.getBytes("BytesField"));
+    assertEquals(rs.getInt("IntegerField"), 0);
+    assertNull(rs.getTimestamp("TimestampField"));
+    assertNull(rs.getDate("DateField"));
+    assertTrue(rs.getDouble("FloatField") == 0.0d);
+    assertTrue(rs.getDouble("NumericField") == 0.0d);
+    assertNull(rs.getTime("TimeField"));
+    assertNull(rs.getString("DateTimeField"));
+    assertNull(rs.getString("GeographyField"));
+    assertNull(rs.getBytes("BytesField_1"));
+    assertFalse(rs.getBoolean("BooleanField_1"));
+
+    assertTrue(rs.next()); // second row
+    // second row is non null, comparing the values
+    assertEquals("StringValue1", rs.getString("StringField"));
+    assertTrue(rs.getDouble("BigNumericField") == 0.3333333333333333d);
+    assertFalse(rs.getBoolean("BooleanField"));
+    assertNotNull(rs.getBytes("BytesField"));
+    assertEquals(1, rs.getInt("IntegerField"));
+    assertEquals(1534680695123L, rs.getTimestamp("TimestampField").getTime());
+    assertEquals(java.sql.Date.valueOf("2018-08-19"), rs.getDate("DateField"));
+    assertTrue(rs.getDouble("FloatField") == 10.1d);
+    assertTrue(rs.getDouble("NumericField") == 100.0d);
+    assertEquals(
+        Time.valueOf(LocalTime.of(12, 11, 35, 123456)).toString(),
+        rs.getTime("TimeField").toString());
+    assertEquals("2018-08-19T12:11:35.123456", rs.getString("DateTimeField"));
+    assertEquals("POINT(-122.35022 47.649154)", rs.getString("GeographyField"));
+    assertNotNull(rs.getBytes("BytesField_1"));
+    assertTrue(rs.getBoolean("BooleanField_1"));
+    List<BigDecimal> integerArray = (List<BigDecimal>) rs.getArray("IntegerArrayField").getArray();
+    assertEquals(4, integerArray.size());
+    assertEquals(3, integerArray.get(2).intValue());
 
     assertFalse(rs.next()); // no 3rd row in the table
   }
@@ -3611,8 +4094,7 @@ public class ITBigQueryTest {
     assertEquals(300000, cnt); // total 300000 rows should be read
   }
 
-  // @Test - Temporarily disabling till https://github.com/googleapis/gax-java/issues/1712 or
-  // b/235591056 are resolved
+  @Test
   public void testReadAPIIterationAndOrder()
       throws SQLException { // use read API to read 300K records and check the order
     String query =
@@ -3651,7 +4133,8 @@ public class ITBigQueryTest {
 
   @Test
   public void testReadAPIIterationAndOrderAsync()
-      throws SQLException, ExecutionException,
+      throws SQLException,
+          ExecutionException,
           InterruptedException { // use read API to read 300K records and check the order
     String query =
         "SELECT date, county, state_name, confirmed_cases, deaths / 10 FROM "
@@ -3698,7 +4181,8 @@ public class ITBigQueryTest {
   // be uncompleted in 1000ms is nondeterministic! Though very likely it won't be complete in the
   // specified amount of time
   public void testExecuteSelectAsyncCancel()
-      throws SQLException, ExecutionException,
+      throws SQLException,
+          ExecutionException,
           InterruptedException { // use read API to read 300K records and check the order
     String query =
         "SELECT date, county, state_name, confirmed_cases, deaths FROM "
@@ -3744,7 +4228,8 @@ public class ITBigQueryTest {
   // be uncompleted in 1000ms is nondeterministic! Though very likely it won't be complete in the
   // specified amount of time
   public void testExecuteSelectAsyncTimeout()
-      throws SQLException, ExecutionException,
+      throws SQLException,
+          ExecutionException,
           InterruptedException { // use read API to read 300K records and check the order
     String query =
         "SELECT date, county, state_name, confirmed_cases, deaths FROM "
@@ -3808,8 +4293,7 @@ public class ITBigQueryTest {
     assertTrue(connection.close());
   }
 
-  // @Test - Temporarily disabling till https://github.com/googleapis/gax-java/issues/1712 or
-  // b/235591056 are resolved
+  @Test
   public void testReadAPIConnectionMultiClose()
       throws
           SQLException { // use read API to read 300K records, then closes the connection. This test
@@ -3907,6 +4391,19 @@ public class ITBigQueryTest {
         assertEquals(
             (integerArrayFieldValue.get(2).getNumericValue()).intValue(),
             (integerArrayFieldValueColInd.get(2).getNumericValue()).intValue());
+      }
+
+      List<FieldValue> integerArrayFieldValueList =
+          (List<FieldValue>) rs.getArray("IntegerArrayField").getArray();
+      List<FieldValue> integerArrayFieldValueListColInd =
+          (List<FieldValue>) rs.getArray(14).getArray();
+      assertEquals(
+          integerArrayFieldValueList.size(),
+          integerArrayFieldValueListColInd.size()); // Array has 4 elements
+      if (integerArrayFieldValueList.size() == 4) { // as we are picking the third index
+        assertEquals(
+            (integerArrayFieldValueList.get(2).getNumericValue()).intValue(),
+            (integerArrayFieldValueListColInd.get(2).getNumericValue()).intValue());
       }
     }
   }
@@ -5249,11 +5746,31 @@ public class ITBigQueryTest {
     assertEquals(createdJob.getSelfLink(), remoteJob.getSelfLink());
     assertEquals(createdJob.getUserEmail(), remoteJob.getUserEmail());
 
-    Job completedJob = remoteJob.waitFor(RetryOption.totalTimeout(Duration.ofMinutes(1)));
+    Job completedJob = remoteJob.waitFor(RetryOption.totalTimeoutDuration(Duration.ofMinutes(1)));
     assertNotNull(completedJob);
     assertNull(completedJob.getStatus().getError());
     assertTrue(createdTable.delete());
     assertTrue(bigquery.delete(destinationTable));
+  }
+
+  @Test
+  public void testCreateJobAndWaitForWithRetryOptions()
+      throws InterruptedException, TimeoutException {
+    // Note: This only tests the non failure/retry case. For retry cases, see unit tests with mocked
+    // RPC calls.
+    QueryJobConfiguration config =
+        QueryJobConfiguration.newBuilder("SELECT CURRENT_TIMESTAMP() as ts")
+            .setDefaultDataset(DATASET)
+            .setUseLegacySql(false)
+            .build();
+
+    BigQueryRetryConfig bigQueryRetryConfig = BigQueryRetryConfig.newBuilder().build();
+    JobOption bigQueryRetryConfigOption = JobOption.bigQueryRetryConfig(bigQueryRetryConfig);
+    JobOption retryOptions = JobOption.retryOptions(RetryOption.maxAttempts(1));
+
+    Job job = bigquery.create(JobInfo.of(config), bigQueryRetryConfigOption, retryOptions);
+    job = job.waitFor(bigQueryRetryConfig);
+    assertEquals(DONE, job.getStatus().getState());
   }
 
   @Test
@@ -5297,8 +5814,8 @@ public class ITBigQueryTest {
     assertNull(remoteJob.getUserEmail());
     Job completedJob =
         remoteJob.waitFor(
-            RetryOption.initialRetryDelay(Duration.ofSeconds(1)),
-            RetryOption.totalTimeout(Duration.ofMinutes(1)));
+            RetryOption.initialRetryDelayDuration(Duration.ofSeconds(1)),
+            RetryOption.totalTimeoutDuration(Duration.ofMinutes(1)));
     assertNotNull(completedJob);
     assertTrue(createdTable.delete());
     assertNull(completedJob.getStatus().getError());
@@ -5977,6 +6494,14 @@ public class ITBigQueryTest {
 
     assertThat(location).isNotEqualTo(wrongLocation);
 
+    Tracer tracer = otel.getTracer("Test Tracer");
+    bigquery =
+        bigquery.getOptions().toBuilder()
+            .setEnableOpenTelemetryTracing(true)
+            .setOpenTelemetryTracer(tracer)
+            .build()
+            .getService();
+
     Dataset dataset =
         bigquery.create(
             DatasetInfo.newBuilder("locationset_" + UUID.randomUUID().toString().replace("-", "_"))
@@ -6053,6 +6578,11 @@ public class ITBigQueryTest {
             bigquery.writer(
                 JobId.newBuilder().setLocation(location).build(), writeChannelConfiguration)) {
           writer.write(ByteBuffer.wrap("foo".getBytes()));
+          assertEquals(
+              OTEL_ATTRIBUTES
+                  .get("com.google.cloud.bigquery.TableDataWriteChannel.open")
+                  .get(AttributeKey.stringKey("bq.job.location")),
+              location);
         }
 
         try {
@@ -6065,13 +6595,19 @@ public class ITBigQueryTest {
       }
     } finally {
       bigquery.delete(dataset.getDatasetId(), DatasetDeleteOption.deleteContents());
+      bigquery =
+          bigquery.getOptions().toBuilder()
+              .setEnableOpenTelemetryTracing(false)
+              .setOpenTelemetryTracer(null)
+              .build()
+              .getService();
     }
   }
 
   @Test
-  public void testPreserveAsciiControlCharacters()
+  public void testWriteChannelPreserveAsciiControlCharacters()
       throws InterruptedException, IOException, TimeoutException {
-    String destinationTableName = "test_preserve_ascii_control_characters";
+    String destinationTableName = "test_write_channel_preserve_ascii_control_characters";
     TableId tableId = TableId.of(DATASET, destinationTableName);
     WriteChannelConfiguration configuration =
         WriteChannelConfiguration.newBuilder(tableId)
@@ -6092,6 +6628,26 @@ public class ITBigQueryTest {
     FieldValueList row = rows.getValues().iterator().next();
     assertEquals("\u0000", row.get(0).getStringValue());
     assertTrue(bigquery.delete(tableId));
+  }
+
+  @Test
+  public void testLoadJobPreserveAsciiControlCharacters() throws InterruptedException {
+    String destinationTableName = "test_load_job_preserve_ascii_control_characters";
+    TableId destinationTable = TableId.of(DATASET, destinationTableName);
+
+    try {
+      LoadJobConfiguration configuration =
+          LoadJobConfiguration.newBuilder(destinationTable, "gs://" + BUCKET + "/" + LOAD_FILE_NULL)
+              .setFormatOptions(
+                  CsvOptions.newBuilder().setPreserveAsciiControlCharacters(true).build())
+              .setSchema(SIMPLE_SCHEMA)
+              .build();
+      Job remoteLoadJob = bigquery.create(JobInfo.of(configuration));
+      remoteLoadJob = remoteLoadJob.waitFor();
+      assertNull(remoteLoadJob.getStatus().getError());
+    } finally {
+      assertTrue(bigquery.delete(destinationTable));
+    }
   }
 
   @Test
@@ -6627,26 +7183,19 @@ public class ITBigQueryTest {
     RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
     BigQuery bigQuery = bigqueryHelper.getOptions().getService();
 
-    // Simulate setting the QUERY_PREVIEW_ENABLED environment variable.
-    bigQuery.getOptions().setQueryPreviewEnabled("TRUE");
+    // Stateless query should have no job id.
+    bigQuery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_OPTIONAL);
     TableResult tableResult = executeSimpleQuery(bigQuery);
     assertNotNull(tableResult.getQueryId());
     assertNull(tableResult.getJobId());
 
-    // The flag should be case-insensitive.
-    bigQuery.getOptions().setQueryPreviewEnabled("tRuE");
+    // Job creation takes over, no query id is created.
+    bigQuery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_REQUIRED);
     tableResult = executeSimpleQuery(bigQuery);
-    assertNotNull(tableResult.getQueryId());
-    assertNull(tableResult.getJobId());
-
-    // Any other values won't enable optional job creation mode.
-    bigQuery.getOptions().setQueryPreviewEnabled("test_value");
-    tableResult = executeSimpleQuery(bigQuery);
-    assertNotNull(tableResult.getQueryId());
+    assertNull(tableResult.getQueryId());
     assertNotNull(tableResult.getJobId());
 
-    // Reset the flag.
-    bigQuery.getOptions().setQueryPreviewEnabled(null);
+    bigQuery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_MODE_UNSPECIFIED);
     tableResult = executeSimpleQuery(bigQuery);
     assertNotNull(tableResult.getQueryId());
     assertNotNull(tableResult.getJobId());
@@ -6671,8 +7220,8 @@ public class ITBigQueryTest {
     // Create local BigQuery for test scenario 1 to not contaminate global test parameters.
     RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
     BigQuery bigQuery = bigqueryHelper.getOptions().getService();
-    // Simulate setting the QUERY_PREVIEW_ENABLED environment variable.
-    bigQuery.getOptions().setQueryPreviewEnabled("TRUE");
+    // Allow queries to be stateless.
+    bigQuery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_OPTIONAL);
     String query = "SELECT 1 as one";
     QueryJobConfiguration configStateless = QueryJobConfiguration.newBuilder(query).build();
     TableResult result = bigQuery.query(configStateless);
@@ -6724,7 +7273,7 @@ public class ITBigQueryTest {
               table.getTableId().getTable());
 
       // Test stateless query when BigQueryOption location matches dataset location.
-      bigQuery.getOptions().setQueryPreviewEnabled("TRUE");
+      bigQuery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_OPTIONAL);
       TableResult tb = bigQuery.query(QueryJobConfiguration.of(query));
       assertNull(tb.getJobId());
 
@@ -6732,7 +7281,9 @@ public class ITBigQueryTest {
       try {
         BigQuery bigQueryWrongLocation =
             bigqueryHelper.getOptions().toBuilder().setLocation(wrongLocation).build().getService();
-        bigQueryWrongLocation.getOptions().setQueryPreviewEnabled("TRUE");
+        bigQueryWrongLocation
+            .getOptions()
+            .setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_OPTIONAL);
         bigQueryWrongLocation.query(QueryJobConfiguration.of(query));
         fail("querying a table with wrong location shouldn't work");
       } catch (BigQueryException e) {
@@ -6747,9 +7298,7 @@ public class ITBigQueryTest {
   public void testUniverseDomainWithInvalidUniverseDomain() {
     RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
     BigQueryOptions bigQueryOptions =
-        bigqueryHelper
-            .getOptions()
-            .toBuilder()
+        bigqueryHelper.getOptions().toBuilder()
             .setCredentials(loadCredentials(FAKE_JSON_CRED_WITH_GOOGLE_DOMAIN))
             .setUniverseDomain("invalid.domain")
             .build();
@@ -6773,9 +7322,7 @@ public class ITBigQueryTest {
   public void testInvalidUniverseDomainWithMismatchCredentials() {
     RemoteBigQueryHelper bigqueryHelper = RemoteBigQueryHelper.create();
     BigQueryOptions bigQueryOptions =
-        bigqueryHelper
-            .getOptions()
-            .toBuilder()
+        bigqueryHelper.getOptions().toBuilder()
             .setCredentials(loadCredentials(FAKE_JSON_CRED_WITH_INVALID_DOMAIN))
             .build();
     BigQuery bigQuery = bigQueryOptions.getService();
@@ -7038,5 +7585,184 @@ public class ITBigQueryTest {
     assertNotNull(remoteTable);
     assertTrue(remoteTable.getDefinition() instanceof MaterializedViewDefinition);
     assertTrue(remoteTable.delete());
+  }
+
+  @Test
+  public void testOpenTelemetryTracingDatasets() {
+    Tracer tracer = otel.getTracer("Test Tracer");
+    BigQueryOptions otelOptions =
+        BigQueryOptions.newBuilder()
+            .setEnableOpenTelemetryTracing(true)
+            .setOpenTelemetryTracer(tracer)
+            .build();
+    BigQuery bigquery = otelOptions.getService();
+
+    Span parentSpan =
+        tracer
+            .spanBuilder("Test Parent Span")
+            .setNoParent()
+            .setAttribute("test-attribute", "test-value")
+            .startSpan();
+    String billingModelDataset = RemoteBigQueryHelper.generateDatasetName();
+
+    try (Scope parentScope = parentSpan.makeCurrent()) {
+      DatasetInfo info =
+          DatasetInfo.newBuilder(billingModelDataset)
+              .setDescription(DESCRIPTION)
+              .setMaxTimeTravelHours(72L)
+              .setLabels(LABELS)
+              .build();
+
+      Dataset dataset = bigquery.create(info);
+      assertNotNull(dataset);
+      dataset = bigquery.getDataset(dataset.getDatasetId().getDataset());
+      assertNotNull(dataset);
+
+      DatasetInfo updatedInfo =
+          DatasetInfo.newBuilder(billingModelDataset)
+              .setDescription("Updated Description")
+              .setMaxTimeTravelHours(96L)
+              .setLabels(LABELS)
+              .build();
+
+      dataset = bigquery.update(updatedInfo, DatasetOption.accessPolicyVersion(2));
+      assertEquals(dataset.getDescription(), "Updated Description");
+      assertTrue(bigquery.delete(dataset.getDatasetId()));
+    } finally {
+      parentSpan.end();
+      Map<AttributeKey<?>, Object> createMap =
+          OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.createDataset");
+      assertEquals(createMap.get(AttributeKey.stringKey("bq.dataset.location")), "null");
+      assertEquals(
+          OTEL_ATTRIBUTES
+              .get("com.google.cloud.bigquery.BigQueryRpc.createDataset")
+              .get(AttributeKey.stringKey("bq.rpc.service")),
+          "DatasetService");
+
+      Map<AttributeKey<?>, Object> getMap =
+          OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.getDataset");
+      assertEquals(getMap.get(AttributeKey.stringKey("bq.dataset.id")), billingModelDataset);
+
+      Map<AttributeKey<?>, Object> updateMap =
+          OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.updateDataset");
+      assertEquals(updateMap.get(AttributeKey.stringKey("bq.option.ACCESS_POLICY_VERSION")), "2");
+
+      Map<AttributeKey<?>, Object> deleteMap =
+          OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.deleteDataset");
+      assertEquals(deleteMap.get(AttributeKey.stringKey("bq.dataset.id")), billingModelDataset);
+
+      // All should be children spans of parentSpan
+      assertEquals(
+          OTEL_SPAN_IDS_TO_NAMES.get(
+              OTEL_PARENT_SPAN_IDS.get("com.google.cloud.bigquery.BigQuery.getDataset")),
+          "Test Parent Span");
+      assertEquals(
+          OTEL_SPAN_IDS_TO_NAMES.get(
+              OTEL_PARENT_SPAN_IDS.get("com.google.cloud.bigquery.BigQuery.createDataset")),
+          "Test Parent Span");
+      assertEquals(
+          OTEL_SPAN_IDS_TO_NAMES.get(
+              OTEL_PARENT_SPAN_IDS.get("com.google.cloud.bigquery.BigQuery.deleteDataset")),
+          "Test Parent Span");
+      assertEquals(
+          OTEL_SPAN_IDS_TO_NAMES.get(
+              OTEL_PARENT_SPAN_IDS.get("com.google.cloud.bigquery.BigQueryRpc.createDataset")),
+          "com.google.cloud.bigquery.BigQueryRetryHelper.runWithRetries");
+      assertEquals(OTEL_PARENT_SPAN_IDS.get("Test Parent Span"), OTEL_PARENT_SPAN_ID);
+      RemoteBigQueryHelper.forceDelete(bigquery, billingModelDataset);
+    }
+  }
+
+  @Test
+  public void testOpenTelemetryTracingTables() {
+    Tracer tracer = otel.getTracer("Test Tracer");
+    BigQueryOptions otelOptions =
+        BigQueryOptions.newBuilder()
+            .setEnableOpenTelemetryTracing(true)
+            .setOpenTelemetryTracer(tracer)
+            .build();
+    BigQuery bigquery = otelOptions.getService();
+
+    String tableName = "test_otel_table";
+    StandardTableDefinition tableDefinition = StandardTableDefinition.of(TABLE_SCHEMA);
+    TableInfo tableInfo =
+        TableInfo.newBuilder(TableId.of(DATASET, tableName), tableDefinition)
+            .setDescription("Some Description")
+            .build();
+    Table createdTable = bigquery.create(tableInfo);
+    assertThat(createdTable.getDescription()).isEqualTo("Some Description");
+
+    assertEquals(
+        OTEL_PARENT_SPAN_IDS.get("com.google.cloud.bigquery.BigQuery.createTable"),
+        OTEL_PARENT_SPAN_ID);
+    assertEquals(
+        OTEL_ATTRIBUTES
+            .get("com.google.cloud.bigquery.BigQuery.createTable")
+            .get(AttributeKey.stringKey("bq.table.id")),
+        tableName);
+    assertEquals(
+        OTEL_ATTRIBUTES
+            .get("com.google.cloud.bigquery.BigQuery.createTable")
+            .get(AttributeKey.stringKey("bq.table.creation_time")),
+        "null");
+    assertEquals(
+        OTEL_ATTRIBUTES
+            .get("com.google.cloud.bigquery.BigQueryRpc.createTable")
+            .get(AttributeKey.stringKey("bq.rpc.method")),
+        "InsertTable");
+
+    Table updatedTable =
+        bigquery.update(createdTable.toBuilder().setDescription("Updated Description").build());
+    assertThat(updatedTable.getDescription()).isEqualTo("Updated Description");
+
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.updateTable"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQueryRpc.patchTable"));
+    assertEquals(
+        OTEL_PARENT_SPAN_IDS.get("com.google.cloud.bigquery.BigQuery.updateTable"),
+        OTEL_PARENT_SPAN_ID);
+    assertTrue(bigquery.delete(updatedTable.getTableId()));
+  }
+
+  @Test
+  public void testOpenTelemetryTracingQuery() throws InterruptedException {
+    Tracer tracer = otel.getTracer("Test Tracer");
+    BigQueryOptions otelOptions =
+        BigQueryOptions.newBuilder()
+            .setEnableOpenTelemetryTracing(true)
+            .setOpenTelemetryTracer(tracer)
+            .build();
+    BigQuery bigquery = otelOptions.getService();
+
+    // Stateless query
+    bigquery.getOptions().setDefaultJobCreationMode(JobCreationMode.JOB_CREATION_OPTIONAL);
+    TableResult tableResult = executeSimpleQuery(bigquery);
+    assertNotNull(tableResult.getQueryId());
+    assertNull(tableResult.getJobId());
+
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.queryRpc"));
+    assertNotNull(
+        OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQueryRetryHelper.runWithRetries"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQueryRpc.queryRpc"));
+    assertTrue(OTEL_ATTRIBUTES.containsKey("com.google.cloud.bigquery.BigQuery.query"));
+
+    // Query job
+    String query = "SELECT TimestampField, StringField, BooleanField FROM " + TABLE_ID.getTable();
+    QueryJobConfiguration config =
+        QueryJobConfiguration.newBuilder(query).setDefaultDataset(DatasetId.of(DATASET)).build();
+    Job job = bigquery.create(JobInfo.of(JobId.of(), config));
+
+    TableResult result = job.getQueryResults();
+    assertNotNull(result.getJobId());
+    assertEquals(QUERY_RESULT_SCHEMA, result.getSchema());
+
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.getQueryResults"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.listTableData"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQueryRpc.listTableData"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQuery.createJob"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQueryRpc.createJob"));
+    // Key exists, but value is null because no options were supplied in the request.
+    assertTrue(OTEL_ATTRIBUTES.containsKey("com.google.cloud.bigquery.Job.getQueryResults"));
+    assertNotNull(OTEL_ATTRIBUTES.get("com.google.cloud.bigquery.BigQueryRpc.getQueryResults"));
+    assertTrue(OTEL_ATTRIBUTES.containsKey("com.google.cloud.bigquery.Job.waitForQueryResults"));
   }
 }

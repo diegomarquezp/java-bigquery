@@ -27,6 +27,7 @@ import com.google.api.services.bigquery.model.QueryParameter;
 import com.google.auto.value.AutoValue;
 import com.google.cloud.StringEnumType;
 import com.google.cloud.StringEnumValue;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Function;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.MoreObjects.ToStringHelper;
@@ -396,6 +397,7 @@ public abstract class JobStatistics implements Serializable {
     private final BiEngineStats biEngineStats;
     private final Integer billingTier;
     private final Boolean cacheHit;
+    private Boolean useReadApi;
     private final String ddlOperationPerformed;
     private final TableId ddlTargetTable;
     private final RoutineId ddlTargetRoutine;
@@ -796,6 +798,7 @@ public abstract class JobStatistics implements Serializable {
       this.biEngineStats = builder.biEngineStats;
       this.billingTier = builder.billingTier;
       this.cacheHit = builder.cacheHit;
+      this.useReadApi = false;
       this.ddlOperationPerformed = builder.ddlOperationPerformed;
       this.ddlTargetTable = builder.ddlTargetTable;
       this.ddlTargetRoutine = builder.ddlTargetRoutine;
@@ -833,6 +836,18 @@ public abstract class JobStatistics implements Serializable {
      */
     public Boolean getCacheHit() {
       return cacheHit;
+    }
+
+    /** Returns whether the query result is read from the high throughput ReadAPI. */
+    @VisibleForTesting
+    public Boolean getUseReadApi() {
+      return useReadApi;
+    }
+
+    /** Sets internal state to reflect the use of the high throughput ReadAPI. */
+    @VisibleForTesting
+    public void setUseReadApi(Boolean useReadApi) {
+      this.useReadApi = useReadApi;
     }
 
     /** [BETA] For DDL queries, returns the operation applied to the DDL target table. */
@@ -1385,7 +1400,8 @@ public abstract class JobStatistics implements Serializable {
       private String name;
       private Long slotMs;
 
-      private Builder() {};
+      private Builder() {}
+      ;
 
       Builder setName(String name) {
         this.name = name;
@@ -1471,7 +1487,8 @@ public abstract class JobStatistics implements Serializable {
 
       private String transactionId;
 
-      private Builder() {};
+      private Builder() {}
+      ;
 
       Builder setTransactionId(String transactionId) {
         this.transactionId = transactionId;
@@ -1542,7 +1559,8 @@ public abstract class JobStatistics implements Serializable {
 
       private String sessionId;
 
-      private Builder() {};
+      private Builder() {}
+      ;
 
       Builder setSessionId(String sessionId) {
         this.sessionId = sessionId;

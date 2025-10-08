@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Google Inc.
+ * Copyright 2024 Google LLC
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,6 @@
 package com.example.bigquery;
 
 import static com.google.common.truth.Truth.assertThat;
-import static junit.framework.TestCase.assertNotNull;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
@@ -25,34 +24,14 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.junit.After;
 import org.junit.Before;
-import org.junit.BeforeClass;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.JUnit4;
 
-/** Tests for simple app sample. */
-@RunWith(JUnit4.class)
-@SuppressWarnings("checkstyle:abbreviationaswordinname")
-public class SimpleAppIT {
+public class SimpleQueryConnectionReadApiIT {
 
   private final Logger log = Logger.getLogger(this.getClass().getName());
   private ByteArrayOutputStream bout;
   private PrintStream out;
   private PrintStream originalPrintStream;
-  private static final String PROJECT_ID = requireEnvVar("GOOGLE_CLOUD_PROJECT");
-
-  private static String requireEnvVar(String varName) {
-    String value = System.getenv(varName);
-    assertNotNull(
-        "Environment variable " + varName + " is required to perform these tests.",
-        System.getenv(varName));
-    return value;
-  }
-
-  @BeforeClass
-  public static void checkRequirements() {
-    requireEnvVar("GOOGLE_CLOUD_PROJECT");
-  }
 
   @Before
   public void setUp() {
@@ -71,9 +50,12 @@ public class SimpleAppIT {
   }
 
   @Test
-  public void testQuickstart() throws Exception {
-    SimpleApp.simpleApp(PROJECT_ID);
-    String got = bout.toString();
-    assertThat(got).contains("https://stackoverflow.com/questions/");
+  public void testSimpleQueryConnectionReadApi() {
+    String query =
+        "SELECT corpus, count(*) as corpus_count "
+            + "FROM `bigquery-public-data.samples.shakespeare` GROUP BY corpus;";
+
+    SimpleQueryConnectionReadApi.simpleQueryConnectionReadApi(query);
+    assertThat(bout.toString()).contains("Query ran successfully");
   }
 }
