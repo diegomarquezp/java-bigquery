@@ -78,14 +78,12 @@ jobs:
               new_version: newVersion,
               branch_name: `update-jdk-${newVersion}`
             };
-
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "build: add testing for JDK ${{ steps.update_file.outputs.new_version }}"
-          branch: ${{ steps.update_file.outputs.branch_name }}
-          delete-branch: true
-          title: "build: add testing for JDK ${{ steps.update_file.outputs.new_version }}"
-          body: "generated with Update Java Version in CI GitHub action"
-          labels: "automerge"
+        run: |
+          gh pr create \
+            --base main \
+            --head ${{ steps.update_file.outputs.branch_name }} \
+            --title "build: add testing for JDK ${{ steps.update_file.outputs.new_version }}" \
+            --body "generated with Update Java Version in CI GitHub action"
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_GH_TOKEN }}
