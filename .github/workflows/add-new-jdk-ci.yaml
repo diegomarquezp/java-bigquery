@@ -82,8 +82,8 @@ jobs:
         run: |
           gh pr create \
             --base main \
-            --head ${{ steps.update_file.outputs.branch_name }} \
-            --title "build: add testing for JDK ${{ steps.update_file.outputs.new_version }}" \
-            --body "generated with Update Java Version in CI GitHub action"
+            --head update-ci-version-${{ github.event.inputs.java_version }} \
+            --title 'build: add testing for JDK ${{ steps.update_file.outputs.new_version }}' \
+            --body 'generated with Update Java Version in CI GitHub action'
         env:
           GITHUB_TOKEN: ${{ secrets.MY_GH_TOKEN }}
